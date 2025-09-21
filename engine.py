@@ -43,29 +43,63 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         if args.bce_loss:
             targets = targets.gt(0.0).type(targets.dtype)
          
-        with torch.cuda.amp.autocast():
-            outputs = model(samples)
-            if not args.cosub:
-                loss = criterion(samples, outputs, targets)
-            else:
-                outputs = torch.split(outputs, outputs.shape[0]//2, dim=0)
-                loss = 0.25 * criterion(outputs[0], targets) 
-                loss = loss + 0.25 * criterion(outputs[1], targets) 
-                loss = loss + 0.25 * criterion(outputs[0], outputs[1].detach().sigmoid())
-                loss = loss + 0.25 * criterion(outputs[1], outputs[0].detach().sigmoid()) 
+        if args.grad_accum_steps > 1:
+            optimizer.zero_grad()
 
-        loss_value = loss.item()
+            sample_chunks = torch.chunk(samples, args.grad_accum_steps, dim=0)
+            target_chunks = torch.chunk(targets, args.grad_accum_steps, dim=0)
+            loss_value = 0.0
+            for i in range(args.grad_accum_steps):
+                with torch.cuda.amp.autocast():
+                    outputs = model(sample_chunks[i])
+                    if not args.cosub:
+                        loss = criterion(sample_chunks[i], outputs, target_chunks[i])
+                    else:
+                        outputs_split = torch.split(outputs, outputs.shape[0] // 2, dim=0)
+                        loss = 0.25 * criterion(outputs_split[0], target_chunks[i])
+                        loss += 0.25 * criterion(outputs_split[1], target_chunks[i])
+                        loss += 0.25 * criterion(outputs_split[0], outputs_split[1].detach().sigmoid())
+                        loss += 0.25 * criterion(outputs_split[1], outputs_split[0].detach().sigmoid())
+                    loss = loss / args.grad_accum_steps  # Normalize loss
+                
+                chunk_loss_value = loss.item()
 
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
+                if not math.isfinite(chunk_loss_value):
+                    print("Loss is {}, stopping training".format(chunk_loss_value))
+                    sys.exit(1)
 
-        optimizer.zero_grad()
+                loss_value += chunk_loss_value
 
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
+                is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+                need_update = (i == args.grad_accum_steps - 1)  # Only update optimizer/scaler on the last chunk
+                loss_scaler(loss, optimizer, clip_grad=max_norm, 
+                            parameters=model.parameters(), create_graph=is_second_order, 
+                            need_update=need_update)
+
+        else:
+            with torch.cuda.amp.autocast():
+                outputs = model(samples)
+                if not args.cosub:
+                    loss = criterion(samples, outputs, targets)
+                else:
+                    outputs = torch.split(outputs, outputs.shape[0]//2, dim=0)
+                    loss = 0.25 * criterion(outputs[0], targets) 
+                    loss = loss + 0.25 * criterion(outputs[1], targets) 
+                    loss = loss + 0.25 * criterion(outputs[0], outputs[1].detach().sigmoid())
+                    loss = loss + 0.25 * criterion(outputs[1], outputs[0].detach().sigmoid()) 
+
+            loss_value = loss.item()
+
+            if not math.isfinite(loss_value):
+                print("Loss is {}, stopping training".format(loss_value))
+                sys.exit(1)
+
+            optimizer.zero_grad()
+
+            # this attribute is added by timm on one optimizer (adahessian)
+            is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+            loss_scaler(loss, optimizer, clip_grad=max_norm,
+                        parameters=model.parameters(), create_graph=is_second_order)
 
         torch.cuda.synchronize()
         if model_ema is not None:
@@ -80,7 +114,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device):
+def evaluate(data_loader, model, device, chunk_size=1):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -95,7 +129,13 @@ def evaluate(data_loader, model, device):
 
         # compute output
         with torch.cuda.amp.autocast():
-            output = model(images)
+            if chunk_size > 1:
+                output_chunks = []
+                for image_chunk in torch.chunk(images, chunk_size, dim=0):
+                    output_chunks.append(model(image_chunk))
+                output = torch.cat(output_chunks, dim=0)
+            else:
+                output = model(images)
             loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
